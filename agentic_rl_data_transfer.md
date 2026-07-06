@@ -177,6 +177,14 @@ V_ref_logp = 134.2M × 4 B ≈ 536.9 MB                   （π_ref，GRPO 的 K
 
 GRPO 需要**参考模型的额外一次全量前向**（算力，见边 G 附加项）+ 上述 536.9 MB 参考 logprob 跨阶段传输。
 
+> **`π_old` 前向是否必须？—— 一个可选但有代价的优化。**
+> Rollout 引擎生成时为了采样，本身就会算出每个生成 token 的 logits/logprob，理论上可以直接复用这份 `log π_old`，省掉训练引擎侧那次专门的全量前向（§4 边 G 附加项里的 4.5 TB/GPU）。但多数生产级框架（veRL、OpenRLHF 等）**默认仍然重算**，原因是：
+> 1. 推理引擎（vLLM/SGLang，常用 PagedAttention + 低精度/FP8）与训练引擎（FSDP，BF16/FP32）数值路径不同，同一份权重算出的 logits 存在细微漂移；
+> 2. GRPO/PPO 的 `ratio = π_new/π_old` 一旦分母掺入「引擎数值噪声」而非纯粹的「策略漂移」，在 clip range 较窄时会让 clipping 判断失真；
+> 3. agentic 多轮轨迹里工具/环境注入的 token 并非模型采样产生，天然没有生成时 logprob 可复用，仍需一次 teacher-forcing 前向补齐。
+>
+> **`π_ref` 前向则没有这条捷径**：参考模型是冻结的初始/SFT 权重，从第一次策略更新之后就与生成轨迹用的 `π_θ` 不同，其 logprob 不可能是 rollout 生成的副产物，必须专门起一次前向——这是 GRPO KL 项的刚性成本，不像 `π_old` 前向那样可选。
+
 ### 边 F — mini-batch 取数（缓冲区 → 训练）
 
 通常经验缓冲区与训练引擎同机/同进程，取 mini-batch 走本地内存，**一般不计入跨网传输**。每迭代分 `n_steps=32` 个 mini-batch 取出，每个 mini-batch（32 prompt×G=16=512 条轨迹）≈ `512×16384×4B ≈ 33.5 MB`；32 个 mini-batch 累计 = 总量 `μ × V_C` ≈ `μ × 1.07 GB`，与边 C 总量一致（μ=1 即整批数据只被取用一遍）。
@@ -244,7 +252,8 @@ n_steps = μ × N_p / mini = 1024 / 32 = 32
 | 权重同步（A） | 分离部署时 141 GB/步跨集群 | colocated 共卡 + CUDA IPC；FP8 同步；bucket 化 overlap；降低同步频率（受 off-policy 容忍度限制） |
 | Rollout 生成 | agentic 长序列 + 长尾轨迹拖慢整批 | 连续批处理、partial rollout、异步 off-policy、长度惩罚 |
 | 训练通信（G） | ~13.5 TB/GPU/迭代 | TP+PP 混合并行、序列并行、通信-计算重叠、序列打包去 padding、梯度 BF16 reduce |
-| 参考模型（KL） | 额外 4.5 TB/GPU 前向 | 参考 logprob 缓存/低频刷新；降低 KL 系数换取跳过部分前向；固定间隔重算参考模型 |
+| 参考模型（KL） | 额外 4.5 TB/GPU 前向 | 参考 logprob 缓存/低频刷新；降低 KL 系数换取跳过部分前向；固定间隔重算参考模型（★该前向刚性存在，无法像 old logprob 一样直接复用生成期数据） |
+| old logprob 前向 | 额外 4.5 TB/GPU 前向 | 复用 rollout 引擎生成时的 logits/logprob，跳过训练侧重算；代价是推理/训练引擎数值路径不同带来的 ratio 噪声，需结合 clip range 权衡（agentic 场景下工具注入 token 仍需补算） |
 | 显存 | 优化器状态 ~846 GB | ZeRO-3 分片、CPU offload、优化器状态 8-bit |
 
 ---
