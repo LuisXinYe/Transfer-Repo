@@ -45,7 +45,69 @@
 
 ## 2. 核心板块:RL / Agentic RL 后训练的可靠性
 
-### 2.1 角色级容错 —— RobustRL 
+### 2.1 先厘清:恢复动作的层次与关系
+
+阅读后文的各篇工作之前，先把恢复动作的层次摆清楚——容错方案的差别，本质上就是在哪一层切开、切开后保留什么。以你们方案的九个恢复动作为例，因为它是目前覆盖层次最完整的一条阶梯，后文各篇工作都可以对照它定位。
+
+文档总结图把两条平行链画成了一条，这是最容易误读的地方。
+
+总结里写的是 `TokenRetry → InstanceRestart → StepRetry → ProcessRestart → JobRestart`，读起来像九级线性阶梯。但把 6.2–6.6 各节末尾的「升级」原文拼起来是这样:
+
+| 节 | 升级到 |
+|---|---|
+| 6.2 TokenRetry | 多次重推失败 → InstanceRestart |
+| 6.3 InstanceRestart | 多次无法恢复 / 健康节点不足 → 直接上报 ClusterX 进编排层 |
+| 6.4 StepRetry | 失败 / MindIO 无法原地修 → ProcessRestart / JobRestart |
+| 6.5 ProcessRestart | 失败 → JobRestart |
+| 6.6 JobRestart | 仍失败 → 上报 ClusterX |
+
+`InstanceRestart` 失败后不会进 `StepRetry`，它直接上浮编排层。 真实结构是**两条平行链**:
+
+```
+推理侧   TokenRetry ──▶ InstanceRestart ─────────────┐
+                                                     │
+训练侧   StepRetry ──▶ ProcessRestart ──▶ JobRestart ─┤
+                                                     ▼
+                                    ┌─ 编排层(ClusterX 决策)─┐
+                                    │ StoreRestart           │
+                                    │ JobResubmit            │
+                                    │ PodReschedule          │
+                                    │ ClusterRecreate        │
+                                    └───────────┬────────────┘
+                                                ▼
+                                            人工介入
+                          (AgenticRLJob CRD 始终不重建 = 不动点)
+```
+
+分成两条是**对的(推理与训练是两个子系统，一个挂了不该去重试另一个)，只是总结图画错了**，建议改为两条线。
+
+最清晰的心智模型:每一档 = 一条「重建什么 / 保留什么」的切线，越往下切得越深:
+
+| 动作 | 重建的对象 | 保留下来的 |
+|---|---|---|
+| TokenRetry | 一次 token 推送 | 一切 |
+| InstanceRestart | 一个 vLLM 进程(冷启动) | 训练侧全部 + 其他实例 |
+| StepRetry | 一个训练 step 的计算 | 进程不杀、通信域、权重 |
+| ProcessRestart | FSDP Worker 进程 + HCCL 通信域 | Driver、内存中的 `training_state`、全部 vLLM |
+| JobRestart | Driver + 全部训练进程 | Pod、RayCluster、Store |
+| StoreRestart | Store Pod ＋ 连带删/重建 RayJob | Pod 调度、RayCluster |
+| JobResubmit | RayJob(提交链路) | RayCluster、WorkerPod |
+| PodReschedule | 一个 WorkerPod(换节点) | RayCluster 本体 |
+| ClusterRecreate | 整个 RayCluster | AgenticRLJob CRD |
+
+两条分界线:
+
+- ProcessRestart / JobRestart 之间 = **Driver 在不在。Driver 还在 → 内存里的 `training_state` 还在;没了 → 必须从 Store/NFS 读回。这就是"状态外置"整件事的存在理由。**
+- JobRestart / 编排层之间 = **Pod 动不动**。进程内恢复不碰 K8s 资源;编排层要删 Pod、等调度、拉镜像、重新图编译，量级完全不同。
+
+**两个排序陷阱**:
+
+1. StoreRestart 的名字骗人——流程第 3 步「删除 RayJob，保护训练数据完整性」，它实际包含一次 JobResubmit，论影响半径 `StoreRestart ≳ JobResubmit`，排序是反的。建议改为**有界本地缓冲 + 背压:写入方缓冲一个有界窗口(如 60s / N MB)，满则阻塞上游;Store 恢复后排空。只有停机超过该窗口才升级到删 RayJob——既保证数据完整性(数据被持有而非丢弃)，又切断"秒级故障 → 分钟级重建"的放大链。且数据库型 Store 自带持久化，更不该照删**。
+2. **编排层四档是并列不是递进——StoreRestart / JobResubmit / PodReschedule 对应四种不同触发场景**，只有 ClusterRecreate 兼具兜底含义;而进程内两条链才是真正的递进(同一对象逐级加码)。建议文档用不同符号区分(递进 `→`、并列 `|`)，现在统一用箭头必然被误读成九级阶梯。
+
+---
+
+### 2.2 角色级容错 —— RobustRL 
 
 Role-Based Fault Tolerance System for LLM RL Post-Training，arXiv:2512.22492(2025-12-27)，浙大等。
 
@@ -60,7 +122,7 @@ Role-Based Fault Tolerance System for LLM RL Post-Training，arXiv:2512.22492(20
 
 ---
 
-### 2.2 Agentic 专属容错 —— Belayer
+### 2.3 Agentic 专属容错 —— Belayer
 
 Belayer: Efficient Fault Tolerance for LLM Agentic RL Training，arXiv:2608.14635(2026-07-28，v2 2026-08-18)，Jiecheng Zhou, Qinghao Hu, Peng Sun, Xingcheng Zhang, Weiming Zhang。
 
@@ -80,7 +142,7 @@ Belayer: Efficient Fault Tolerance for LLM Agentic RL Training，arXiv:2608.1463
 
 **可借鉴点**:
 
-对照 `InstanceRestart`(§6.3)，差异可以逐步对上:
+对照你们的 `InstanceRestart`(§6.3)，差异可以逐步对上:
 
 | | 你们现有流程 | shadow 方案 |
 |---|---|---|
@@ -106,7 +168,7 @@ Belayer: Efficient Fault Tolerance for LLM Agentic RL Training，arXiv:2608.1463
 
 ---
 
-### 2.3 框架级工程实践:心跳 + 路由摘除(slime / GLM-5)
+### 2.4 框架级工程实践:心跳 + 路由摘除(slime / GLM-5)
 
 **GLM-5 技术报告(arXiv:2602.15763)与 slime** 框架(THUDM，GLM-4.5 至 GLM-5.3 的 RL 底座)。
 
@@ -127,7 +189,7 @@ GLM-5 报告侧的表述:rollout server 周期发心跳由编排层监控，不�
 
 ---
 
-### 2.4 训练动力学故障(不是硬件挂了，是"跑飞了")—— RFT-FaultBench / RFT-FM 
+### 2.5 训练动力学故障(不是硬件挂了，是"跑飞了")—— RFT-FaultBench / RFT-FM 
 
 Towards Robust LLM Post-Training: Automatic Failure Management for Reinforcement Fine-Tuning，arXiv:2605.04431(2026-05-06)，Lingzhe Zhang, Tong Jia, Yunpeng Zhai, Liancheng Fang, Kening Zheng, Hongyi Liu, Xiaosong Huang, Philip S. Yu, Ying Li。
 
@@ -179,7 +241,7 @@ Towards Robust LLM Post-Training: Automatic Failure Management for Reinforcement
 
 ---
 
-### 2.5 解耦 / 异步架构:可靠性的红利与新风险
+### 2.6 解耦 / 异步架构:可靠性的红利与新风险
 
 这一批 2026 工作主要目标是**吞吐**，但架构选择直接决定了故障半径，所以必须一起看。
 
@@ -198,7 +260,7 @@ Towards Robust LLM Post-Training: Automatic Failure Management for Reinforcement
 
 ---
 
-### 2.6 被严重低估的一层:环境与沙箱 
+### 2.7 被严重低估的一层:环境与沙箱 
 
 Agentic RL 里 rollout 时间的大头常常不在 GPU 上，而在沙箱里。
 
@@ -215,7 +277,7 @@ Agentic RL 里 rollout 时间的大头常常不在 GPU 上，而在沙箱里。
 
 ---
 
-### 2.7 权重同步的可靠性 
+### 2.8 权重同步的可靠性 
 
 权重同步是 RL 后训练独有的、横跨两个通信域的关键路径，也是单点最多的地方。
 
@@ -351,7 +413,7 @@ Agentic RL 里 rollout 时间的大头常常不在 GPU 上，而在沙箱里。
 
 ## 7. 映射到你们的 AgenticRL 平台(verl + agent-lightning，Ascend + K8s)
 
-按你们方案的模块，逐条给出最值得参考的来源:
+恢复动作之间的层次与升级关系见 §2.1。本节按模块逐条给出最值得参考的来源:
 
 | 你们的模块 | 最相关的工作 | 具体可搬运的东西 |
 |---|---|---|
@@ -371,7 +433,7 @@ Agentic RL 里 rollout 时间的大头常常不在 GPU 上，而在沙箱里。
 
 ### 7.1 三方对比:你们的方案 vs RobustRL vs Belayer
 
-> 已按原文核对更正三处:(a) RobustRL 的故障模型**是硬件的(§2.2 明确以机器故障立论，点名 GPU 掉卡与 ECC)，非早期表述的"换机器";(b) 你们已有环境/工具故障的兜底链;(c) 你们已有**路由摘除。
+> 已按原文核对更正三处:(a) RobustRL 的故障模型**是硬件的**——其论文 §2.2 以机器故障立论，点名 GPU 掉卡与 ECC，非早期表述的"换机器";(b) 你们**已有**环境/工具故障的兜底链;(c) 你们**已有**路由摘除。
 
 | 维度 | RobustRL | Belayer | 你们的 AgenticRL |
 |---|---|---|---|
@@ -458,67 +520,6 @@ Agentic RL 里 rollout 时间的大头常常不在 GPU 上，而在沙箱里。
 - trainer 侧**领先两篇论文**(StepRetry 原地修复 > RobustRL 全体重启 > Belayer 不管);编排层与硬件故障为你们独有。
 - 缺口只剩两条:① `InstanceRestart` 是冷启动;② 环境故障只有「丢弃」一档。
 - 新增风险:**判死权威不唯一**。Belayer 收归 router、RobustRL 收归 RolloutManager，而你们 Driver/SDK、LLMServerManager、MindIO 三方都能发起，需确认不会同时判死同一对象(脑裂)。
-
-### 7.2 九个恢复动作到底是什么关系
-
-文档总结图把两条平行链画成了一条，这是最容易误读的地方。
-
-总结里写的是 `TokenRetry → InstanceRestart → StepRetry → ProcessRestart → JobRestart`，读起来像九级线性阶梯。但把 6.2–6.6 各节末尾的「升级」原文拼起来是这样:
-
-| 节 | 升级到 |
-|---|---|
-| 6.2 TokenRetry | 多次重推失败 → InstanceRestart |
-| 6.3 InstanceRestart | 多次无法恢复 / 健康节点不足 → 直接上报 ClusterX 进编排层 |
-| 6.4 StepRetry | 失败 / MindIO 无法原地修 → ProcessRestart / JobRestart |
-| 6.5 ProcessRestart | 失败 → JobRestart |
-| 6.6 JobRestart | 仍失败 → 上报 ClusterX |
-
-`InstanceRestart` 失败后不会进 `StepRetry`，它直接上浮编排层。 真实结构是**两条平行链**:
-
-```
-推理侧   TokenRetry ──▶ InstanceRestart ─────────────┐
-                                                     │
-训练侧   StepRetry ──▶ ProcessRestart ──▶ JobRestart ─┤
-                                                     ▼
-                                    ┌─ 编排层(ClusterX 决策)─┐
-                                    │ StoreRestart           │
-                                    │ JobResubmit            │
-                                    │ PodReschedule          │
-                                    │ ClusterRecreate        │
-                                    └───────────┬────────────┘
-                                                ▼
-                                            人工介入
-                          (AgenticRLJob CRD 始终不重建 = 不动点)
-```
-
-分成两条是**对的(推理与训练是两个子系统，一个挂了不该去重试另一个)，只是总结图画错了**，建议改为两条线。
-
-最清晰的心智模型:每一档 = 一条「重建什么 / 保留什么」的切线，越往下切得越深:
-
-| 动作 | 重建的对象 | 保留下来的 |
-|---|---|---|
-| TokenRetry | 一次 token 推送 | 一切 |
-| InstanceRestart | 一个 vLLM 进程(冷启动) | 训练侧全部 + 其他实例 |
-| StepRetry | 一个训练 step 的计算 | 进程不杀、通信域、权重 |
-| ProcessRestart | FSDP Worker 进程 + HCCL 通信域 | Driver、内存中的 `training_state`、全部 vLLM |
-| JobRestart | Driver + 全部训练进程 | Pod、RayCluster、Store |
-| StoreRestart | Store Pod ＋ 连带删/重建 RayJob | Pod 调度、RayCluster |
-| JobResubmit | RayJob(提交链路) | RayCluster、WorkerPod |
-| PodReschedule | 一个 WorkerPod(换节点) | RayCluster 本体 |
-| ClusterRecreate | 整个 RayCluster | AgenticRLJob CRD |
-
-两条分界线:
-
-- ProcessRestart / JobRestart 之间 = **Driver 在不在。Driver 还在 → 内存里的 `training_state` 还在;没了 → 必须从 Store/NFS 读回。这就是"状态外置"整件事的存在理由。**
-- JobRestart / 编排层之间 = **Pod 动不动**。进程内恢复不碰 K8s 资源;编排层要删 Pod、等调度、拉镜像、重新图编译，量级完全不同。
-
-**两个排序陷阱**:
-
-1. StoreRestart 的名字骗人——流程第 3 步「删除 RayJob，保护训练数据完整性」，它实际包含一次 JobResubmit，论影响半径 `StoreRestart ≳ JobResubmit`，排序是反的。建议改为**有界本地缓冲 + 背压:写入方缓冲一个有界窗口(如 60s / N MB)，满则阻塞上游;Store 恢复后排空。只有停机超过该窗口才升级到删 RayJob——既保证数据完整性(数据被持有而非丢弃)，又切断"秒级故障 → 分钟级重建"的放大链。且数据库型 Store 自带持久化，更不该照删**。
-2. **编排层四档是并列不是递进——StoreRestart / JobResubmit / PodReschedule 对应四种不同触发场景**，只有 ClusterRecreate 兼具兜底含义;而进程内两条链才是真正的递进(同一对象逐级加码)。建议文档用不同符号区分(递进 `→`、并列 `|`)，现在统一用箭头必然被误读成九级阶梯。
-
----
-
 ## 8. 参考文献清单
 
 ### 2026 新工作(本次已核对原文)
