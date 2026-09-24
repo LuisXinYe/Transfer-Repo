@@ -47,8 +47,6 @@
 
 ### 2.1 恢复动作的层次与关系
 
-`TokenRetry → InstanceRestart → StepRetry → ProcessRestart → JobRestart`，读起来像九级线性阶梯。但把 6.2–6.6 各节末尾的「升级」原文拼起来是这样:
-
 | 节 | 升级到 |
 |---|---|
 | 6.2 TokenRetry | 多次重推失败 → InstanceRestart |
