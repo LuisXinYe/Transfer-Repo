@@ -80,7 +80,7 @@ Belayer: Efficient Fault Tolerance for LLM Agentic RL Training，arXiv:2608.1463
 
 **可借鉴点**:
 
-对照你们的 `InstanceRestart`(§6.3)，差异可以逐步对上:
+对照 `InstanceRestart`(§6.3)，差异可以逐步对上:
 
 | | 你们现有流程 | shadow 方案 |
 |---|---|---|
